@@ -1,4 +1,5 @@
 import contextlib
+import logging
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -242,6 +243,45 @@ def test_curl_get_file_restarts_when_server_refuses_the_resume_range(tmp_path):
         output.write_bytes(b" Tes")
         get_file(server.application_url, str(output))
         assert output.read_bytes() == b" Test123 "
+
+
+# Credentials Galaxy puts in the URLs it gives Pulsar: its job key, its staging
+# URL signatures, and the signatures of presigned object store URLs.
+CREDENTIALS = {
+    "job_key": "jobkeysecret",
+    "sig": "sigsecret",
+    "Signature": "v2secret",
+    "X-Amz-Signature": "v4secret",
+    "X-Amz-Security-Token": "tokensecret",
+}
+CREDENTIALS_QUERY = "&".join(f"{name}={value}" for name, value in CREDENTIALS.items())
+
+
+def _assert_names_the_file_but_no_credentials(text):
+    assert "path=/data/input.dat" in text
+    for value in CREDENTIALS.values():
+        assert value not in text
+
+
+@skip_unless_module("pycurl")
+def test_curl_logs_name_the_url_without_its_credentials(tmp_path, caplog):
+    # A resume the server refuses logs the URL as the transfer resumes and as it restarts.
+    with server_for_test_app(TestApp(_RangeRefusingApp(b" Test123 ", reported_size=100))) as server:
+        output = tmp_path / "out"
+        output.write_bytes(b" Tes")
+        with caplog.at_level(logging.INFO, logger=curl_transport.__name__):
+            get_file(f"{server.application_url}?path=/data/input.dat&{CREDENTIALS_QUERY}", str(output))
+    assert len(caplog.records) == 2
+    _assert_names_the_file_but_no_credentials(caplog.text)
+
+
+@skip_unless_module("pycurl")
+def test_curl_errors_name_the_url_without_its_credentials(tmp_path):
+    with files_server() as (server, directory):
+        url = f"{server.application_url}?path=/data/input.dat&{CREDENTIALS_QUERY}"
+        with pytest.raises(PulsarClientTransportError) as raised:
+            get_file(url, str(tmp_path / "out"))
+    _assert_names_the_file_but_no_credentials(str(raised.value))
 
 
 def test_urllib_status_code():

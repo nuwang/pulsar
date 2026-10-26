@@ -1,6 +1,7 @@
 import io
 import logging
 import os.path
+import re
 from contextlib import contextmanager
 
 import requests
@@ -26,6 +27,9 @@ POST_FAILED_MESSAGE = "Failed to post_file properly for url %s, remote server re
 GET_FAILED_MESSAGE = "Failed to get_file properly for url %s, remote server returned status code of %s."
 # Bounded explicitly: libcurl before 8.3 follows redirect loops forever by default.
 MAX_REDIRECTS = 5
+# Query parameters that carry a credential: Galaxy's job key and staging URL
+# signatures, and the signatures of presigned object store URLs.
+CREDENTIAL_PARAMETER = re.compile(r"([?&](?:job_key|sig|Signature|X-Amz-Signature|X-Amz-Security-Token)=)[^&#]*")
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +73,7 @@ def post_file(url, path):
     if not os.path.exists(path):
         # pycurl doesn't always produce a great exception for this,
         # wrap it in a better one.
-        message = NO_SUCH_FILE_MESSAGE % (path, url)
+        message = NO_SUCH_FILE_MESSAGE % (path, _redacted(url))
         raise FileNotFoundError(message)
     with _curl_object_for_url(url) as c:
         c.setopt(c.HTTPPOST, [("file", (c.FORM_FILE, path.encode('ascii')))])
@@ -79,19 +83,19 @@ def post_file(url, path):
             raise PulsarClientTransportError(
                 code=PulsarClientTransportError.NOT_200,
                 transport_code=status_code,
-                transport_message=POST_FAILED_MESSAGE % (url, status_code),
+                transport_message=POST_FAILED_MESSAGE % (_redacted(url), status_code),
             )
 
 
 def get_size(url) -> int:
     with requests.head(url, headers={"accept-encoding": "identity"}, allow_redirects=True) as response:
         if response.status_code >= 299:
-            log.warning("Response to HEAD request for '%s' with status code %s, cannot resume download", url, response.status_code)
+            log.warning("Response to HEAD request for '%s' with status code %s, cannot resume download", _redacted(url), response.status_code)
             return -1
         try:
             return int(response.headers["content-length"])
         except KeyError:
-            log.error("'content-length' header not sent for '%s', cannot resume download", url)
+            log.error("'content-length' header not sent for '%s', cannot resume download", _redacted(url))
             return -1
 
 
@@ -113,7 +117,7 @@ def get_file(url, path: str):
         if not (resume_from and _resume_refused(exc)):
             raise
         # The partial file can never be completed from here.
-        log.info("server for %s cannot resume this transfer, downloading it again", url)
+        log.info("server for %s cannot resume this transfer, downloading it again", _redacted(url))
         _download(url, path, 0)
 
 
@@ -135,7 +139,7 @@ def _download(url, path: str, resume_from: int):
             c.setopt(c.FOLLOWLOCATION, 1)
             c.setopt(c.MAXREDIRS, MAX_REDIRECTS)
             if resume_from:
-                log.info('transfer of %s will resume at %s bytes', url, resume_from)
+                log.info('transfer of %s will resume at %s bytes', _redacted(url), resume_from)
                 c.setopt(c.RESUME_FROM, resume_from)
             _perform(c)
             status_code = int(c.getinfo(HTTP_CODE))
@@ -143,7 +147,7 @@ def _download(url, path: str, resume_from: int):
                 raise PulsarClientTransportError(
                     code=PulsarClientTransportError.NOT_200,
                     transport_code=status_code,
-                    transport_message=GET_FAILED_MESSAGE % (url, status_code),
+                    transport_message=GET_FAILED_MESSAGE % (_redacted(url), status_code),
                 )
     finally:
         buf.close()
@@ -151,6 +155,11 @@ def _download(url, path: str, resume_from: int):
 
 def _open_output(output_path, mode='wb'):
     return open(output_path, mode) if output_path else io.BytesIO()
+
+
+def _redacted(url: str) -> str:
+    """``url`` with its credentials hidden, for logs and error messages."""
+    return CREDENTIAL_PARAMETER.sub(r"\1REDACTED", url)
 
 
 @contextmanager
